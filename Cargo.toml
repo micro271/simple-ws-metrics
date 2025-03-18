@@ -1,0 +1,15 @@
+[package]
+name = "vn_back"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+axum = "0.8.1"
+cors = "0.1.0"
+dotenv = "0.15.0"
+serde = { version = "1.0.219", features = ["derive"] }
+serde_json = "1.0.140"
+tokio = { version = "1.44.1", features = ["full"] }
+tower-http = { version = "0.6.2", features = ["cors", "fs", "trace", "tracing"] }
+tracing = "0.1.41"
+tracing-subscriber = { version = "0.3.19", features = ["env-filter"] }
