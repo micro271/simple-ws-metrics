@@ -110,7 +110,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 }
             } else {
                 router.route(
-                    &format!("/asset/{}", path.file_name().unwrap().to_str().unwrap()),
+                    &format!("/assets/{}", path.file_name().unwrap().to_str().unwrap()),
                     get(async || {
                         Response::builder()
                             .header(
@@ -132,7 +132,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             }
         });
 
-    let (tx, _) = broadcast::channel(128);
+    let (tx, _) = broadcast::channel(64);
 
     let state = offices
         .into_iter()
@@ -161,13 +161,17 @@ mod handlers {
             Path, State,
             ws::{WebSocket, WebSocketUpgrade},
         },
-        http::StatusCode,
+        http::{StatusCode, Uri},
         response::Response,
     };
     use serde_json::json;
+    use std::{env, sync::OnceLock};
+    use tokio::time::{self, Duration};
     use tracing::instrument;
 
     type StateData = Arc<RwLock<HashMap<String, Sender<Data>>>>;
+
+    static TIMEOUT: OnceLock<u64> = OnceLock::new();
 
     pub async fn handler(
         State(state): State<StateData>,
@@ -178,73 +182,74 @@ mod handlers {
     }
 
     pub async fn last(state: StateData, office: String, mut ws: WebSocket) {
-        let mut rx = {
-            let state = state.read().await;
-            if let Some(e) = state.get(&office) {
-                e.subscribe()
-            } else {
-                return;
-            }
+        let mut rx = match state.read().await.get(&office) {
+            Some(e) => e.subscribe(),
+            _ => return,
         };
 
-        while let Ok(Ok(e)) =
-            tokio::time::timeout(tokio::time::Duration::from_secs(10), rx.recv()).await
-        {
-            if let Err(e) = ws
+        let timeout = TIMEOUT.get_or_init(|| {
+            env::var("TIMEOUT")
+                .ok()
+                .and_then(|x| x.parse().ok())
+                .unwrap_or(10)
+        });
+
+        loop {
+            if let Ok(Ok(data)) = time::timeout(Duration::from_secs(*timeout), rx.recv()).await {
+                if let Err(e) = ws
+                    .send(axum::extract::ws::Message::Text(
+                        json!(&data).to_string().into(),
+                    ))
+                    .await
+                {
+                    tracing::error!("Web Socket error: {}", e.to_string());
+                    return;
+                }
+            } else if let Err(e) = ws
                 .send(axum::extract::ws::Message::Text(
-                    json!(e).to_string().into(),
+                    json!(Data::default()).to_string().into(),
                 ))
                 .await
             {
-                tracing::error!("WebSocket error: {}", e.to_string());
+                tracing::error!("[TIMEOUT] Web Socket error {}", e.to_string());
                 return;
             }
         }
-
-        if let Err(e) = ws
-            .send(axum::extract::ws::Message::Text(
-                json!(Data::default()).to_string().into(),
-            ))
-            .await
-        {
-            tracing::error!("[Subscriber Dead]: WebSocket error: {}", e)
-        }
-
-        tracing::error!("Peer TX error");
     }
 
     #[instrument]
     pub async fn insert(
         State(state): State<StateData>,
         Path(office): Path<String>,
+        uri: Uri,
         Json(data): Json<Data>,
     ) -> StatusCode {
-        let state = state.read().await;
+        match state.read().await.get(&office) {
+            Some(tx) => {
+                tracing::debug!("Receibes: {}", tx.receiver_count());
 
-        if let Some(tx) = state.get(&office) {
-            tracing::debug!("Receibes: {}", tx.receiver_count());
-            if tx.receiver_count() > 0 {
-                tracing::info!("New DATA: {:?}", data);
-                if let Err(e) = tx.send(data) {
-                    tracing::error!("{:?}", e);
-                    return StatusCode::INTERNAL_SERVER_ERROR;
+                if tx.receiver_count() > 0 {
+                    tracing::info!("New DATA receive: {:?}", data);
+                    if let Err(e) = tx.send(data) {
+                        tracing::error!("Sender error: {:?}", e);
+                        return StatusCode::INTERNAL_SERVER_ERROR;
+                    }
                 }
-            }
-        } else {
-            tracing::error!("The office {:?} does not find", data);
-        }
 
-        StatusCode::OK
+                StatusCode::OK
+            }
+            _ => {
+                tracing::error!("Path {} not found", uri);
+                StatusCode::BAD_REQUEST
+            }
+        }
     }
 }
 
 async fn get_paths() -> Result<Vec<PathBuf>, String> {
     let mut resp = Vec::new();
-
     let mut dirs = VecDeque::new();
-
     let allow_extensions = ["css", "js", "html"];
-
     let path_html = env::var("WWW").unwrap_or("./www".to_string());
 
     tracing::info!("Web directory: {}", path_html);
