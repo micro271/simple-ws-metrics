@@ -105,12 +105,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                         }),
                     )
                 } else {
-                    tracing::info!("Exclude {:?}", path);
+                    tracing::warn!("Exclude {:?}", path);
                     router
                 }
             } else {
                 router.route(
-                    &format!("/{}", path.file_name().unwrap().to_str().unwrap()),
+                    &format!("/asset/{}", path.file_name().unwrap().to_str().unwrap()),
                     get(async || {
                         Response::builder()
                             .header(
@@ -187,13 +187,30 @@ mod handlers {
             }
         };
 
-        while let Ok(e) = rx.recv().await {
-            ws.send(axum::extract::ws::Message::Text(
-                json!(e).to_string().into(),
+        while let Ok(Ok(e)) =
+            tokio::time::timeout(tokio::time::Duration::from_secs(10), rx.recv()).await
+        {
+            if let Err(e) = ws
+                .send(axum::extract::ws::Message::Text(
+                    json!(e).to_string().into(),
+                ))
+                .await
+            {
+                tracing::error!("WebSocket error: {}", e.to_string());
+                return;
+            }
+        }
+
+        if let Err(e) = ws
+            .send(axum::extract::ws::Message::Text(
+                json!(Data::default()).to_string().into(),
             ))
             .await
-            .unwrap()
+        {
+            tracing::error!("[Subscriber Dead]: WebSocket error: {}", e)
         }
+
+        tracing::error!("Peer TX error");
     }
 
     #[instrument]
