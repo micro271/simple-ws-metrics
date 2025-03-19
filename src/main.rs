@@ -9,45 +9,22 @@ use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::{collections::VecDeque, env, net::SocketAddr, path::PathBuf};
-use tokio::{fs, sync::Mutex};
+use tokio::{
+    fs,
+    sync::{
+        RwLock,
+        broadcast::{self, Sender},
+    },
+};
 use tower_http::trace::TraceLayer;
 use tracing::Span;
 use tracing_subscriber::EnvFilter;
 
-#[derive(Debug, Serialize, Deserialize, Default)]
+#[derive(Debug, Serialize, Deserialize, Default, Clone)]
 struct Data {
     combustible: Option<f32>,
     humedad: Option<f32>,
     temperatura: Option<f32>,
-}
-
-#[derive(Debug)]
-struct DataLimit {
-    data: Option<Data>,
-    limit: u8,
-    counter: u8,
-}
-
-impl std::default::Default for DataLimit {
-    fn default() -> Self {
-        Self {
-            data: None,
-            limit: 5,
-            counter: 0,
-        }
-    }
-}
-
-impl DataLimit {
-    fn subtract(&mut self) {
-        self.counter += 1;
-        if self.counter == self.limit {
-            self.data = None;
-        }
-    }
-    fn reset_counter(&mut self) {
-        self.counter = 0;
-    }
 }
 
 #[tokio::main]
@@ -155,26 +132,21 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             }
         });
 
-    let state = Arc::new(Mutex::new({
-        let mut tmp = HashMap::new();
-        for office in offices {
-            tmp.insert(office, DataLimit::default());
-        }
-        tracing::info!("List of data: {:#?}", tmp);
-        tmp
-    }));
+    let (tx, _) = broadcast::channel(128);
+
+    let state = offices
+        .into_iter()
+        .map(|x| (x, tx.clone()))
+        .collect::<HashMap<String, Sender<Data>>>();
+
+    let state = Arc::new(RwLock::new(state));
 
     let route = axum::Router::new()
         .merge(router_html)
-        .route("/ultimo/{office}", get(handlers::last))
+        .route("/last/{office}", get(handlers::handler))
         .route("/api/{office}", post(handlers::insert))
         .with_state(state)
-        .fallback(async |uri: Uri| {
-            (
-                StatusCode::NOT_FOUND,
-                format!("Route {} not found", uri),
-            )
-        })
+        .fallback(async |uri: Uri| (StatusCode::NOT_FOUND, format!("Route {} not found", uri)))
         .layer(trace)
         .layer(tower_http::cors::CorsLayer::new().allow_origin(tower_http::cors::Any));
 
@@ -182,46 +154,45 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 }
 
 mod handlers {
-    use super::{Arc, Data, DataLimit, Mutex};
+    use super::{Arc, Data, HashMap, RwLock, Sender};
     use axum::{
         Json,
-        extract::{Path, State},
-        http::{StatusCode, Uri},
+        extract::{
+            Path, State,
+            ws::{WebSocket, WebSocketUpgrade},
+        },
+        http::StatusCode,
         response::Response,
     };
     use serde_json::json;
-    use std::collections::HashMap;
     use tracing::instrument;
 
-    type StateData = Arc<Mutex<HashMap<String, DataLimit>>>;
+    type StateData = Arc<RwLock<HashMap<String, Sender<Data>>>>;
 
-    pub async fn last(
+    pub async fn handler(
         State(state): State<StateData>,
         Path(office): Path<String>,
-        uri: Uri,
+        ws: WebSocketUpgrade,
     ) -> Response {
-        let mut state = state.lock().await;
-        if let Some(data) = state.get_mut(&office).filter(|x| x.data.is_some()) {
-            data.subtract();
+        ws.on_upgrade(|socket| last(state, office, socket))
+    }
 
-            Response::builder()
-                .header("Content-Type", "application/json")
-                .status(StatusCode::OK)
-                .body(json!(&data.data).to_string().into())
-                .unwrap_or_default()
-        } else {
-            tracing::error!("The office {} is not present in State", office);
-            Response::builder()
-                .status(StatusCode::BAD_REQUEST)
-                .body(
-                    json!({
-                        "Error": "Office not found",
-                        "Uri": uri.to_string(),
-                    })
-                    .to_string()
-                    .into(),
-                )
-                .unwrap_or_default()
+    pub async fn last(state: StateData, office: String, mut ws: WebSocket) {
+        let mut rx = {
+            let state = state.read().await;
+            if let Some(e) = state.get(&office) {
+                e.subscribe()
+            } else {
+                return;
+            }
+        };
+
+        while let Ok(e) = rx.recv().await {
+            ws.send(axum::extract::ws::Message::Text(
+                json!(e).to_string().into(),
+            ))
+            .await
+            .unwrap()
         }
     }
 
@@ -231,16 +202,21 @@ mod handlers {
         Path(office): Path<String>,
         Json(data): Json<Data>,
     ) -> StatusCode {
-        let mut state = state.lock().await;
-        
-        if let Some(e) = state.get_mut(&office) {
-            tracing::info!("New DATA: {:?}", data);
-            e.reset_counter();
-            e.data = Some(data);
+        let state = state.read().await;
+
+        if let Some(tx) = state.get(&office) {
+            tracing::debug!("Receibes: {}", tx.receiver_count());
+            if tx.receiver_count() > 0 {
+                tracing::info!("New DATA: {:?}", data);
+                if let Err(e) = tx.send(data) {
+                    tracing::error!("{:?}", e);
+                    return StatusCode::INTERNAL_SERVER_ERROR;
+                }
+            }
         } else {
             tracing::error!("The office {:?} does not find", data);
         }
-        
+
         StatusCode::OK
     }
 }
