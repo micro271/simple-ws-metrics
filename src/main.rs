@@ -188,10 +188,16 @@ mod handlers {
         };
 
         let timeout = TIMEOUT.get_or_init(|| {
-            env::var("TIMEOUT")
+            let t = env::var("TIMEOUT")
                 .ok()
                 .and_then(|x| x.parse().ok())
-                .unwrap_or(10)
+                .unwrap_or(10);
+            tracing::info!(
+                "The timeout for the subscriptors to wait for the data is {}",
+                t
+            );
+
+            t
         });
 
         loop {
