@@ -167,7 +167,6 @@ mod handlers {
     use serde_json::json;
     use std::{env, sync::OnceLock};
     use tokio::time::{self, Duration};
-    use tracing::instrument;
 
     type StateData = Arc<RwLock<HashMap<String, Sender<Data>>>>;
 
@@ -192,7 +191,7 @@ mod handlers {
                 .ok()
                 .and_then(|x| x.parse().ok())
                 .unwrap_or(10);
-            tracing::info!(
+            tracing::warn!(
                 "The timeout for the subscriptors to wait for the data is {}",
                 t
             );
@@ -223,7 +222,6 @@ mod handlers {
         }
     }
 
-    #[instrument]
     pub async fn insert(
         State(state): State<StateData>,
         Path(office): Path<String>,
@@ -232,10 +230,11 @@ mod handlers {
     ) -> StatusCode {
         match state.read().await.get(&office) {
             Some(tx) => {
-                tracing::debug!("Receibes: {}", tx.receiver_count());
+                tracing::debug!("Receives: {}", tx.receiver_count());
+
+                tracing::info!("[{}] - New DATA receive: {:?}", office, data);
 
                 if tx.receiver_count() > 0 {
-                    tracing::info!("New DATA receive: {:?}", data);
                     if let Err(e) = tx.send(data) {
                         tracing::error!("Sender error: {:?}", e);
                         return StatusCode::INTERNAL_SERVER_ERROR;
